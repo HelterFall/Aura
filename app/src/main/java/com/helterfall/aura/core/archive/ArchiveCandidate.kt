@@ -24,7 +24,7 @@ object ArchiveCandidateDetector {
     private val knownExtensions = mapOf(
         "npa" to "NPA",
         "npk" to "NPK",
-        "pak" to "PAK (вариант пока не определён)",
+        "pak" to "Nitro+ PAK v2/v3 (проверка сигнатуры при открытии)",
         "xp3" to "XP3",
         "arc" to "ARC",
         "cpk" to "CRI CPK",

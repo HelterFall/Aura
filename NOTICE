@@ -1,0 +1,15 @@
+Nitro+ PAK format reference
+----------------------------
+
+The Nitro+ PAK v2/v3 reader in Aura was independently implemented using the
+public GARbro format implementation as a technical reference:
+
+https://github.com/morkt/GARbro/blob/master/ArcFormats/NitroPlus/ArcNitro.cs
+
+GARbro is copyright (C) 2015-2016 by morkt and is distributed under the MIT
+License. The reference implementation's MIT license permits use, modification,
+and distribution subject to retaining the copyright and permission notice.
+
+Aura's Kotlin implementation is a separate implementation and does not include
+the original C# source file. This notice is retained for attribution and
+traceability of the format reference.

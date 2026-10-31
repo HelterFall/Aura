@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -34,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -43,9 +45,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.documentfile.provider.DocumentFile
 import com.helterfall.aura.core.archive.ArchiveCandidateDetector
+import com.helterfall.aura.core.archive.ArchiveExtractor
+import com.helterfall.aura.core.archive.ArchiveIndex
+import com.helterfall.aura.core.archive.ContentResolverRandomAccessDataSource
+import com.helterfall.aura.core.archive.NitroPakReader
 import com.helterfall.aura.core.archive.GameFileEntry
 import com.helterfall.aura.ui.theme.AuraTheme
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
@@ -68,12 +75,21 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun AuraApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var treeUriText by rememberSaveable { mutableStateOf<String?>(null) }
     var entries by remember { mutableStateOf<List<GameFileEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
     var onlyArchives by rememberSaveable { mutableStateOf(false) }
     var selectedEntry by remember { mutableStateOf<GameFileEntry?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    var openArchiveUriText by rememberSaveable { mutableStateOf<String?>(null) }
+    var openArchiveName by rememberSaveable { mutableStateOf<String?>(null) }
+    var archiveIndex by remember { mutableStateOf<ArchiveIndex?>(null) }
+    var archiveLoading by remember { mutableStateOf(false) }
+    var archiveError by remember { mutableStateOf<String?>(null) }
+    var extracting by remember { mutableStateOf(false) }
+    var extractionMessage by remember { mutableStateOf<String?>(null) }
 
     val folderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -88,6 +104,49 @@ private fun AuraApp() {
                 errorMessage = null
             } catch (exception: SecurityException) {
                 errorMessage = "Не удалось сохранить доступ к папке: ${exception.localizedMessage}"
+            }
+        }
+    }
+
+    val outputFolderPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val sourceText = openArchiveUriText
+            val currentIndex = archiveIndex
+            if (sourceText != null && currentIndex != null) {
+                try {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                    scope.launch {
+                        extracting = true
+                        extractionMessage = null
+                        try {
+                            val report = withContext(Dispatchers.IO) {
+                                ArchiveExtractor(context).extractAll(
+                                    archiveUri = Uri.parse(sourceText),
+                                    outputTreeUri = uri,
+                                    archiveName = openArchiveName ?: "archive.pak",
+                                    archive = currentIndex
+                                )
+                            }
+                            val errors = if (report.failures.isEmpty()) "" else
+                                " Ошибок: ${report.failures.size}. " +
+                                    report.failures.take(3).joinToString("; ")
+                            extractionMessage =
+                                "Готово: ${report.extractedFiles} файлов, ${formatBytes(report.extractedBytes)}.$errors"
+                        } catch (exception: Exception) {
+                            extractionMessage =
+                                "Ошибка извлечения: ${exception.localizedMessage ?: "неизвестная ошибка"}"
+                        } finally {
+                            extracting = false
+                        }
+                    }
+                } catch (exception: SecurityException) {
+                    extractionMessage = "Нет доступа на запись в выбранную папку."
+                }
             }
         }
     }
@@ -128,6 +187,29 @@ private fun AuraApp() {
             entries = emptyList()
         } finally {
             loading = false
+        }
+    }
+
+
+    LaunchedEffect(openArchiveUriText) {
+        val rawUri = openArchiveUriText ?: return@LaunchedEffect
+        archiveLoading = true
+        archiveIndex = null
+        archiveError = null
+        extractionMessage = null
+
+        try {
+            val parsed = withContext(Dispatchers.IO) {
+                ContentResolverRandomAccessDataSource(
+                    context.contentResolver,
+                    Uri.parse(rawUri)
+                ).use { source -> NitroPakReader().open(source) }
+            }
+            archiveIndex = parsed
+        } catch (exception: Exception) {
+            archiveError = exception.localizedMessage ?: "Не удалось прочитать PAK."
+        } finally {
+            archiveLoading = false
         }
     }
 
@@ -252,7 +334,7 @@ private fun AuraApp() {
             }
 
             Text(
-                "Пока доступен просмотр файлов и предварительная подсказка по расширению. Чтение игровых архивов будет добавлено отдельно.",
+                "Сейчас доступны просмотр и извлечение Nitro+ PAK v2/v3. Остальные форматы будут подключаться отдельными обработчиками.",
                 modifier = Modifier.padding(bottom = 12.dp),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -271,7 +353,11 @@ private fun AuraApp() {
                     if (entry.archiveCandidate != null) {
                         Text("Кандидат по расширению: ${entry.archiveCandidate.label}")
                         Text(
-                            "Это предварительная подсказка, а не подтверждение формата. Для точного определения Aura должна проверить сигнатуру и структуру файла."
+                            if (entry.archiveCandidate.extension == "pak") {
+                                "Aura проверит сигнатуру при открытии. Сейчас поддерживаются Nitro+ PAK v2 и v3."
+                            } else {
+                                "Формат пока отображается как кандидат. Обработчик этого архива ещё не подключён."
+                            }
                         )
                     } else if (!entry.isDirectory) {
                         Text("Расширение пока не относится к известным кандидатам на архив.")
@@ -279,7 +365,138 @@ private fun AuraApp() {
                 }
             },
             confirmButton = {
-                TextButton(onClick = { selectedEntry = null }) {
+                Row {
+                    if (!entry.isDirectory && entry.archiveCandidate?.extension == "pak") {
+                        TextButton(
+                            onClick = {
+                                openArchiveName = entry.name
+                                openArchiveUriText = entry.uri
+                                selectedEntry = null
+                            }
+                        ) {
+                            Text("Открыть PAK")
+                        }
+                    }
+                    TextButton(onClick = { selectedEntry = null }) {
+                        Text("Закрыть")
+                    }
+                }
+            }
+        )
+    }
+
+
+    if (archiveLoading) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Открытие PAK") },
+            text = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    CircularProgressIndicator()
+                    Text("Проверяем заголовок и читаем индекс…")
+                }
+            },
+            confirmButton = {}
+        )
+    }
+
+    archiveError?.let { message ->
+        AlertDialog(
+            onDismissRequest = {
+                archiveError = null
+                openArchiveUriText = null
+            },
+            title = { Text("Не удалось открыть архив") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = {
+                    archiveError = null
+                    openArchiveUriText = null
+                }) {
+                    Text("Понятно")
+                }
+            }
+        )
+    }
+
+    archiveIndex?.let { archive ->
+        AlertDialog(
+            onDismissRequest = {
+                if (!extracting) {
+                    archiveIndex = null
+                    openArchiveUriText = null
+                    extractionMessage = null
+                }
+            },
+            title = { Text(openArchiveName ?: "PAK") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "${archive.format} v${archive.version} · ${archive.entries.size} файлов",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Text(
+                        "Содержимое индекса. Ресурсы извлекаются в исходном виде, без преобразования изображений и аудио.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 340.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(archive.entries.take(500), key = { "${it.offset}:${it.name}" }) { item ->
+                            Column {
+                                Text(item.name, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    "${formatBytes(item.unpackedSize)} · ${if (item.isCompressed) "zlib" else "без сжатия"}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                    if (archive.entries.size > 500) {
+                        Text(
+                            "Показаны первые 500 записей; при извлечении будут обработаны все файлы.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    if (extracting) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator()
+                            Text("Извлекаем файлы…")
+                        }
+                    }
+                    extractionMessage?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !extracting,
+                    onClick = { outputFolderPicker.launch(null) }
+                ) {
+                    Text("Извлечь всё")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !extracting,
+                    onClick = {
+                        archiveIndex = null
+                        openArchiveUriText = null
+                        extractionMessage = null
+                    }
+                ) {
                     Text("Закрыть")
                 }
             }
