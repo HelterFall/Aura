@@ -3,6 +3,8 @@ package com.helterfall.aura
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -24,6 +26,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -48,6 +51,8 @@ import com.helterfall.aura.core.archive.ArchiveCandidateDetector
 import com.helterfall.aura.core.archive.ArchiveExtractor
 import com.helterfall.aura.core.archive.ArchiveIndex
 import com.helterfall.aura.core.archive.ContentResolverRandomAccessDataSource
+import com.helterfall.aura.core.archive.ExtractionPhase
+import com.helterfall.aura.core.archive.ExtractionProgress
 import com.helterfall.aura.core.archive.NitroPakReader
 import com.helterfall.aura.core.archive.GameFileEntry
 import com.helterfall.aura.ui.theme.AuraTheme
@@ -76,6 +81,7 @@ class MainActivity : ComponentActivity() {
 private fun AuraApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
     var treeUriText by rememberSaveable { mutableStateOf<String?>(null) }
     var entries by remember { mutableStateOf<List<GameFileEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(false) }
@@ -90,6 +96,7 @@ private fun AuraApp() {
     var archiveError by remember { mutableStateOf<String?>(null) }
     var extracting by remember { mutableStateOf(false) }
     var extractionMessage by remember { mutableStateOf<String?>(null) }
+    var extractionProgress by remember { mutableStateOf<ExtractionProgress?>(null) }
 
     val folderPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -123,13 +130,19 @@ private fun AuraApp() {
                     scope.launch {
                         extracting = true
                         extractionMessage = null
+                        extractionProgress = null
                         try {
                             val report = withContext(Dispatchers.IO) {
                                 ArchiveExtractor(context).extractAll(
                                     archiveUri = Uri.parse(sourceText),
                                     outputTreeUri = uri,
                                     archiveName = openArchiveName ?: "archive.pak",
-                                    archive = currentIndex
+                                    archive = currentIndex,
+                                    onProgress = { progress ->
+                                        mainHandler.post {
+                                            extractionProgress = progress
+                                        }
+                                    }
                                 )
                             }
                             val errors = if (report.failures.isEmpty()) "" else
@@ -197,6 +210,7 @@ private fun AuraApp() {
         archiveIndex = null
         archiveError = null
         extractionMessage = null
+        extractionProgress = null
 
         try {
             val parsed = withContext(Dispatchers.IO) {
@@ -446,7 +460,7 @@ private fun AuraApp() {
                     LazyColumn(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(max = 340.dp),
+                            .heightIn(max = if (extracting) 180.dp else 340.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         items(archive.entries.take(500), key = { "${it.offset}:${it.name}" }) { item ->
@@ -466,15 +480,18 @@ private fun AuraApp() {
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    if (extracting) {
+                    extractionProgress?.let { progress ->
+                        ExtractionProgressCard(progress)
+                    } ?: if (extracting) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             CircularProgressIndicator()
-                            Text("Извлекаем файлы…")
+                            Text("Подготавливаем извлечение…")
                         }
                     }
+
                     extractionMessage?.let {
                         Text(it, style = MaterialTheme.typography.bodySmall)
                     }
@@ -514,6 +531,121 @@ private fun AuraApp() {
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun ExtractionProgressCard(progress: ExtractionProgress) {
+    val percent = (progress.fraction * 100f).toInt().coerceIn(0, 100)
+    val phaseLabel = when (progress.phase) {
+        ExtractionPhase.PREPARING -> "Подготовка файлов"
+        ExtractionPhase.EXTRACTING -> "Распаковка"
+        ExtractionPhase.FINISHED -> "Распаковка завершена"
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(phaseLabel, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                Text("$percent%", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            }
+
+            LinearProgressIndicator(
+                progress = { progress.fraction },
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    "Файлы: ${progress.completedFiles} / ${progress.totalFiles}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text(
+                    "Потоки: ${progress.activeFiles.size} / ${progress.workerCount}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            Text(
+                "${formatBytes(progress.processedBytes)} / ${formatBytes(progress.totalBytes)}",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium
+            )
+
+            if (progress.activeFiles.isNotEmpty()) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Сейчас распаковывается", style = MaterialTheme.typography.labelMedium)
+                    progress.activeFiles.take(3).forEach { fileName ->
+                        Text(
+                            "• $fileName",
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1
+                        )
+                    }
+                    if (progress.activeFiles.size > 3) {
+                        Text(
+                            "и ещё ${progress.activeFiles.size - 3}…",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+            } else if (progress.phase == ExtractionPhase.PREPARING) {
+                Text("Подготавливаем структуру папок…", style = MaterialTheme.typography.bodySmall)
+            } else if (progress.phase == ExtractionPhase.EXTRACTING) {
+                Text("Подготавливаем следующий файл…", style = MaterialTheme.typography.bodySmall)
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    if (progress.bytesPerSecond > 0L) "${formatBytes(progress.bytesPerSecond)}/с" else "Скорость —",
+                    style = MaterialTheme.typography.labelMedium
+                )
+                Text(
+                    when {
+                        progress.phase == ExtractionPhase.FINISHED -> "Осталось: 0 с"
+                        progress.estimatedRemainingMillis != null ->
+                            "Осталось ~${formatDuration(progress.estimatedRemainingMillis)}"
+                        else -> "Осталось: расчёт…"
+                    },
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+
+            if (progress.failedFiles > 0) {
+                Text(
+                    "Не удалось обработать: ${progress.failedFiles}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+        }
+    }
+}
+
+private fun formatDuration(milliseconds: Long): String {
+    val seconds = (milliseconds / 1_000L).coerceAtLeast(0L)
+    return if (seconds < 60L) {
+        "$seconds с"
+    } else {
+        "${seconds / 60L} мин ${seconds % 60L} с"
     }
 }
 

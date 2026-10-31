@@ -3,9 +3,47 @@ package com.helterfall.aura.core.archive
 import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
+import java.io.BufferedOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+
+enum class ExtractionPhase {
+    PREPARING,
+    EXTRACTING,
+    FINISHED
+}
+
+data class ExtractionProgress(
+    val phase: ExtractionPhase,
+    val totalFiles: Int,
+    val completedFiles: Int,
+    val totalBytes: Long,
+    val processedBytes: Long,
+    val activeFiles: List<String>,
+    val elapsedMillis: Long,
+    val bytesPerSecond: Long,
+    val estimatedRemainingMillis: Long?,
+    val failedFiles: Int,
+    val workerCount: Int
+) {
+    val fraction: Float
+        get() {
+            if (phase == ExtractionPhase.FINISHED) return 1f
+            if (totalBytes > 0L) {
+                return (processedBytes.toDouble() / totalBytes.toDouble())
+                    .toFloat()
+                    .coerceIn(0f, 1f)
+            }
+            if (totalFiles <= 0) return 0f
+            return (completedFiles.toFloat() / totalFiles).coerceIn(0f, 1f)
+        }
+}
 
 data class ExtractionReport(
     val extractedFiles: Int,
@@ -15,14 +53,17 @@ data class ExtractionReport(
 
 class ArchiveExtractor(
     private val context: Context,
-    private val reader: NitroPakReader = NitroPakReader()
+    private val reader: NitroPakReader = NitroPakReader(),
+    maxParallelFiles: Int = DEFAULT_PARALLEL_FILES
 ) {
+    private val workerCount = maxParallelFiles.coerceIn(1, MAX_PARALLEL_FILES)
 
     fun extractAll(
         archiveUri: Uri,
         outputTreeUri: Uri,
         archiveName: String,
-        archive: ArchiveIndex
+        archive: ArchiveIndex,
+        onProgress: (ExtractionProgress) -> Unit = {}
     ): ExtractionReport {
         val outputTree = DocumentFile.fromTreeUri(context, outputTreeUri)
             ?: throw IOException("Не удалось открыть папку назначения.")
@@ -32,57 +73,161 @@ class ArchiveExtractor(
             .ifBlank { "archive" }
         val outputRoot = createUniqueDirectory(outputTree, "${baseName}_extracted")
 
-        var extractedFiles = 0
-        var extractedBytes = 0L
-        val failures = mutableListOf<String>()
+        val failures = Collections.synchronizedList(mutableListOf<String>())
+        val plannedFiles = ArrayList<PlannedFile>(archive.entries.size)
+        val totalBytes = archive.entries.fold(0L) { total, entry ->
+            if (Long.MAX_VALUE - total < entry.unpackedSize) Long.MAX_VALUE
+            else total + entry.unpackedSize
+        }
+
+        val startedAt = System.nanoTime()
+        val processedBytes = AtomicLong(0L)
+        val completedFiles = AtomicInteger(0)
+        val extractedFiles = AtomicInteger(0)
+        val extractedBytes = AtomicLong(0L)
+        val activeFiles = ConcurrentHashMap.newKeySet<String>()
+        val lastProgressAt = AtomicLong(0L)
+
+        fun publishProgress(phase: ExtractionPhase, force: Boolean = false) {
+            val now = System.nanoTime()
+            if (!force) {
+                val previous = lastProgressAt.get()
+                if (now - previous < PROGRESS_INTERVAL_NANOS ||
+                    !lastProgressAt.compareAndSet(previous, now)
+                ) {
+                    return
+                }
+            } else {
+                lastProgressAt.set(now)
+            }
+
+            val elapsedMillis = ((now - startedAt) / 1_000_000L).coerceAtLeast(0L)
+            val currentBytes = processedBytes.get()
+            val bytesPerSecond = if (elapsedMillis > 0L) {
+                (currentBytes * 1_000L / elapsedMillis).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            val remainingBytes = (totalBytes - currentBytes).coerceAtLeast(0L)
+            val etaMillis = when {
+                phase == ExtractionPhase.FINISHED -> 0L
+                bytesPerSecond > 0L -> remainingBytes * 1_000L / bytesPerSecond
+                else -> null
+            }
+
+            val snapshot = ExtractionProgress(
+                phase = phase,
+                totalFiles = archive.entries.size,
+                completedFiles = completedFiles.get(),
+                totalBytes = totalBytes,
+                processedBytes = currentBytes,
+                activeFiles = activeFiles.toList().sorted().take(MAX_VISIBLE_ACTIVE_FILES),
+                elapsedMillis = elapsedMillis,
+                bytesPerSecond = bytesPerSecond,
+                estimatedRemainingMillis = etaMillis,
+                failedFiles = failures.size,
+                workerCount = workerCount
+            )
+            runCatching { onProgress(snapshot) }
+        }
+
+        publishProgress(ExtractionPhase.PREPARING, force = true)
 
         ContentResolverRandomAccessDataSource(context.contentResolver, archiveUri).use { source ->
+            // Create all SAF entries on the calling thread. Some document providers
+            // serialize directory operations, so only the actual file data transfer
+            // is parallelized.
             for (entry in archive.entries) {
                 val segments = safePathSegments(entry.name)
                 if (segments == null) {
                     failures += "${entry.name}: небезопасный путь"
+                    completedFiles.incrementAndGet()
+                    publishProgress(ExtractionPhase.PREPARING, force = true)
                     continue
                 }
 
-                var parent = outputRoot
                 try {
+                    var parent = outputRoot
                     for (directoryName in segments.dropLast(1)) {
                         parent = findOrCreateDirectory(parent, directoryName)
                     }
-
                     val outputFile = createUniqueFile(parent, segments.last())
-                    try {
-                        val output = context.contentResolver.openOutputStream(outputFile.uri, "w")
-                            ?: throw IOException("Не удалось создать выходной файл.")
-                        output.use { outputStream ->
-                            reader.openEntry(source, archive, entry).use { input ->
-                                extractedBytes += copyExpected(input, outputStream, entry.unpackedSize)
+                    plannedFiles += PlannedFile(entry, outputFile)
+                } catch (error: Exception) {
+                    failures += "${entry.name}: ${error.message ?: "ошибка подготовки файла"}"
+                    completedFiles.incrementAndGet()
+                    publishProgress(ExtractionPhase.PREPARING, force = true)
+                }
+            }
+
+            publishProgress(ExtractionPhase.EXTRACTING, force = true)
+
+            if (plannedFiles.isNotEmpty()) {
+                val executor = Executors.newFixedThreadPool(workerCount)
+                try {
+                    val futures = plannedFiles.map { task ->
+                        executor.submit {
+                            activeFiles.add(task.entry.name)
+                            publishProgress(ExtractionPhase.EXTRACTING, force = true)
+
+                            try {
+                                val rawOutput = context.contentResolver.openOutputStream(
+                                    task.outputFile.uri,
+                                    "w"
+                                ) ?: throw IOException("Не удалось создать выходной файл.")
+
+                                var fileBytes = 0L
+                                BufferedOutputStream(rawOutput, IO_BUFFER_SIZE).use { output ->
+                                    reader.openEntry(source, archive, task.entry).use { input ->
+                                        fileBytes = copyExpected(
+                                            input = input,
+                                            output = output,
+                                            expectedSize = task.entry.unpackedSize
+                                        ) { count ->
+                                            processedBytes.addAndGet(count)
+                                            publishProgress(ExtractionPhase.EXTRACTING)
+                                        }
+                                    }
+                                }
+                                extractedBytes.addAndGet(fileBytes)
+                                extractedFiles.incrementAndGet()
+                            } catch (error: Exception) {
+                                task.outputFile.delete()
+                                failures += "${task.entry.name}: ${error.message ?: "ошибка извлечения"}"
+                            } finally {
+                                activeFiles.remove(task.entry.name)
+                                completedFiles.incrementAndGet()
+                                publishProgress(ExtractionPhase.EXTRACTING, force = true)
                             }
                         }
-                        extractedFiles++
-                    } catch (error: Exception) {
-                        outputFile.delete()
-                        throw error
                     }
-                } catch (error: Exception) {
-                    failures += "${entry.name}: ${error.message ?: "ошибка извлечения"}"
+
+                    futures.forEach { it.get() }
+                } finally {
+                    executor.shutdown()
+                    if (!executor.awaitTermination(EXECUTOR_SHUTDOWN_SECONDS, java.util.concurrent.TimeUnit.SECONDS)) {
+                        executor.shutdownNow()
+                    }
                 }
             }
         }
 
+        publishProgress(ExtractionPhase.FINISHED, force = true)
+
         return ExtractionReport(
-            extractedFiles = extractedFiles,
-            extractedBytes = extractedBytes,
-            failures = failures
+            extractedFiles = extractedFiles.get(),
+            extractedBytes = extractedBytes.get(),
+            failures = synchronized(failures) { failures.toList() }
         )
     }
 
     private fun copyExpected(
         input: InputStream,
         output: OutputStream,
-        expectedSize: Long
+        expectedSize: Long,
+        onBytesCopied: (Long) -> Unit
     ): Long {
-        val buffer = ByteArray(64 * 1024)
+        val buffer = ByteArray(IO_BUFFER_SIZE)
         var total = 0L
 
         while (true) {
@@ -94,6 +239,7 @@ class ArchiveExtractor(
             }
             output.write(buffer, 0, count)
             total += count.toLong()
+            onBytesCopied(count.toLong())
         }
 
         if (total != expectedSize) {
@@ -150,5 +296,19 @@ class ArchiveExtractor(
 
         return parent.createFile("application/octet-stream", candidate)
             ?: throw IOException("Не удалось создать файл: $candidate")
+    }
+
+    private data class PlannedFile(
+        val entry: ArchiveEntryInfo,
+        val outputFile: DocumentFile
+    )
+
+    private companion object {
+        const val DEFAULT_PARALLEL_FILES = 4
+        const val MAX_PARALLEL_FILES = 4
+        const val MAX_VISIBLE_ACTIVE_FILES = 4
+        const val IO_BUFFER_SIZE = 256 * 1024
+        const val PROGRESS_INTERVAL_NANOS = 120_000_000L
+        const val EXECUTOR_SHUTDOWN_SECONDS = 10L
     }
 }

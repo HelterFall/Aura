@@ -357,7 +357,7 @@ class NitroPakReader {
 
     private companion object {
         const val HEADER_SIZE = 0x114
-        const val BUFFER_SIZE = 32 * 1024
+        const val BUFFER_SIZE = 128 * 1024
         const val MAX_ENTRIES = 250_000
         const val MAX_NAME_BYTES = 64 * 1024
         const val MAX_INDEX_PACKED = 64L * 1024L * 1024L
