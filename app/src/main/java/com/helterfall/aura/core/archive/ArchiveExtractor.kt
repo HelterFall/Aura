@@ -54,7 +54,7 @@ data class ExtractionReport(
 class ArchiveExtractor(
     private val context: Context,
     private val reader: NitroPakReader = NitroPakReader(),
-    maxParallelFiles: Int = DEFAULT_PARALLEL_FILES
+    maxParallelFiles: Int = Runtime.getRuntime().availableProcessors().coerceIn(1, MAX_PARALLEL_FILES)
 ) {
     private val workerCount = maxParallelFiles.coerceIn(1, MAX_PARALLEL_FILES)
 
@@ -87,6 +87,7 @@ class ArchiveExtractor(
         val extractedBytes = AtomicLong(0L)
         val activeFiles = ConcurrentHashMap.newKeySet<String>()
         val lastProgressAt = AtomicLong(0L)
+        val transferStartedAt = AtomicLong(0L)
 
         fun publishProgress(phase: ExtractionPhase, force: Boolean = false) {
             val now = System.nanoTime()
@@ -103,8 +104,10 @@ class ArchiveExtractor(
 
             val elapsedMillis = ((now - startedAt) / 1_000_000L).coerceAtLeast(0L)
             val currentBytes = processedBytes.get()
-            val bytesPerSecond = if (elapsedMillis > 0L) {
-                (currentBytes * 1_000L / elapsedMillis).coerceAtLeast(0L)
+            val rateStart = transferStartedAt.get().takeIf { it > 0L } ?: now
+            val rateElapsedMillis = ((now - rateStart) / 1_000_000L).coerceAtLeast(0L)
+            val bytesPerSecond = if (rateElapsedMillis > 0L) {
+                (currentBytes * 1_000L / rateElapsedMillis).coerceAtLeast(0L)
             } else {
                 0L
             }
@@ -160,6 +163,7 @@ class ArchiveExtractor(
                 }
             }
 
+            transferStartedAt.compareAndSet(0L, System.nanoTime())
             publishProgress(ExtractionPhase.EXTRACTING, force = true)
 
             if (plannedFiles.isNotEmpty()) {

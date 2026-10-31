@@ -480,9 +480,11 @@ private fun AuraApp() {
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    extractionProgress?.let { progress ->
-                        ExtractionProgressCard(progress)
-                    } ?: if (extracting) {
+                    if (extractionProgress != null) {
+                        extractionProgress?.let { progress ->
+                            ExtractionProgressCard(progress)
+                        }
+                    } else if (extracting) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp)
