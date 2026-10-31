@@ -574,7 +574,11 @@ private fun ExtractionProgressCard(progress: ExtractionProgress) {
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    "Файлы: ${progress.completedFiles} / ${progress.totalFiles}",
+                    if (progress.phase == ExtractionPhase.PREPARING) {
+                        "Подготовлено: ${progress.preparedFiles} / ${progress.totalFiles}"
+                    } else {
+                        "Файлы: ${progress.completedFiles} / ${progress.totalFiles}"
+                    },
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
@@ -583,11 +587,13 @@ private fun ExtractionProgressCard(progress: ExtractionProgress) {
                 )
             }
 
-            Text(
-                "${formatBytes(progress.processedBytes)} / ${formatBytes(progress.totalBytes)}",
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.Medium
-            )
+            if (progress.phase != ExtractionPhase.PREPARING) {
+                Text(
+                    "${formatBytes(progress.processedBytes)} / ${formatBytes(progress.totalBytes)}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+            }
 
             if (progress.activeFiles.isNotEmpty()) {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -607,7 +613,10 @@ private fun ExtractionProgressCard(progress: ExtractionProgress) {
                     }
                 }
             } else if (progress.phase == ExtractionPhase.PREPARING) {
-                Text("Подготавливаем структуру папок…", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Создаём папки и записи назначения. Скорость зависит от выбранного хранилища.",
+                    style = MaterialTheme.typography.bodySmall
+                )
             } else if (progress.phase == ExtractionPhase.EXTRACTING) {
                 Text("Подготавливаем следующий файл…", style = MaterialTheme.typography.bodySmall)
             }

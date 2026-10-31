@@ -6,10 +6,31 @@ import org.junit.Test
 class ExtractionProgressTest {
 
     @Test
+    fun preparingProgressUsesPreparedFileCount() {
+        val progress = ExtractionProgress(
+            phase = ExtractionPhase.PREPARING,
+            totalFiles = 100,
+            preparedFiles = 42,
+            completedFiles = 0,
+            totalBytes = 10_000L,
+            processedBytes = 0L,
+            activeFiles = emptyList(),
+            elapsedMillis = 1_000L,
+            bytesPerSecond = 0L,
+            estimatedRemainingMillis = null,
+            failedFiles = 0,
+            workerCount = 4
+        )
+
+        assertEquals(0.42f, progress.fraction, 0.001f)
+    }
+
+    @Test
     fun calculatesProgressFromBytes() {
         val progress = ExtractionProgress(
             phase = ExtractionPhase.EXTRACTING,
             totalFiles = 4,
+            preparedFiles = 0,
             completedFiles = 1,
             totalBytes = 1_000L,
             processedBytes = 250L,
@@ -29,6 +50,7 @@ class ExtractionProgressTest {
         val progress = ExtractionProgress(
             phase = ExtractionPhase.EXTRACTING,
             totalFiles = 4,
+            preparedFiles = 0,
             completedFiles = 2,
             totalBytes = 0L,
             processedBytes = 0L,
@@ -48,6 +70,7 @@ class ExtractionProgressTest {
         val progress = ExtractionProgress(
             phase = ExtractionPhase.FINISHED,
             totalFiles = 3,
+            preparedFiles = 0,
             completedFiles = 2,
             totalBytes = 10_000L,
             processedBytes = 4_000L,

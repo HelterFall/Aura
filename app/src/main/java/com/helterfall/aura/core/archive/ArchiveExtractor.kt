@@ -22,6 +22,7 @@ enum class ExtractionPhase {
 data class ExtractionProgress(
     val phase: ExtractionPhase,
     val totalFiles: Int,
+    val preparedFiles: Int,
     val completedFiles: Int,
     val totalBytes: Long,
     val processedBytes: Long,
@@ -35,6 +36,10 @@ data class ExtractionProgress(
     val fraction: Float
         get() {
             if (phase == ExtractionPhase.FINISHED) return 1f
+            if (phase == ExtractionPhase.PREPARING) {
+                if (totalFiles <= 0) return 0f
+                return (preparedFiles.toFloat() / totalFiles).coerceIn(0f, 1f)
+            }
             if (totalBytes > 0L) {
                 return (processedBytes.toDouble() / totalBytes.toDouble())
                     .toFloat()
@@ -75,13 +80,15 @@ class ArchiveExtractor(
 
         val failures = Collections.synchronizedList(mutableListOf<String>())
         val plannedFiles = ArrayList<PlannedFile>(archive.entries.size)
-        val totalBytes = archive.entries.fold(0L) { total, entry ->
-            if (Long.MAX_VALUE - total < entry.unpackedSize) Long.MAX_VALUE
-            else total + entry.unpackedSize
-        }
+        // The output root is newly created, so its contents are known to be empty.
+        // Keep an in-memory directory/name index instead of repeatedly calling
+        // DocumentFile.findFile(), which lists the directory on every lookup.
+        val outputRootState = DirectoryState(outputRoot)
+        val totalBytes = AtomicLong(0L)
 
         val startedAt = System.nanoTime()
         val processedBytes = AtomicLong(0L)
+        val preparedFiles = AtomicInteger(0)
         val completedFiles = AtomicInteger(0)
         val extractedFiles = AtomicInteger(0)
         val extractedBytes = AtomicLong(0L)
@@ -104,6 +111,7 @@ class ArchiveExtractor(
 
             val elapsedMillis = ((now - startedAt) / 1_000_000L).coerceAtLeast(0L)
             val currentBytes = processedBytes.get()
+            val currentTotalBytes = totalBytes.get()
             val rateStart = transferStartedAt.get().takeIf { it > 0L } ?: now
             val rateElapsedMillis = ((now - rateStart) / 1_000_000L).coerceAtLeast(0L)
             val bytesPerSecond = if (rateElapsedMillis > 0L) {
@@ -111,7 +119,7 @@ class ArchiveExtractor(
             } else {
                 0L
             }
-            val remainingBytes = (totalBytes - currentBytes).coerceAtLeast(0L)
+            val remainingBytes = (currentTotalBytes - currentBytes).coerceAtLeast(0L)
             val etaMillis = when {
                 phase == ExtractionPhase.FINISHED -> 0L
                 bytesPerSecond > 0L -> remainingBytes * 1_000L / bytesPerSecond
@@ -121,8 +129,9 @@ class ArchiveExtractor(
             val snapshot = ExtractionProgress(
                 phase = phase,
                 totalFiles = archive.entries.size,
+                preparedFiles = preparedFiles.get(),
                 completedFiles = completedFiles.get(),
-                totalBytes = totalBytes,
+                totalBytes = currentTotalBytes,
                 processedBytes = currentBytes,
                 activeFiles = activeFiles.toList().sorted().take(MAX_VISIBLE_ACTIVE_FILES),
                 elapsedMillis = elapsedMillis,
@@ -137,29 +146,34 @@ class ArchiveExtractor(
         publishProgress(ExtractionPhase.PREPARING, force = true)
 
         ContentResolverRandomAccessDataSource(context.contentResolver, archiveUri).use { source ->
-            // Create all SAF entries on the calling thread. Some document providers
-            // serialize directory operations, so only the actual file data transfer
-            // is parallelized.
+            // SAF providers may be slow. Directory lookups are resolved from the
+            // in-memory tree because this output root was just created by Aura.
+            // This avoids listing the same growing directory for every file.
             for (entry in archive.entries) {
-                val segments = safePathSegments(entry.name)
-                if (segments == null) {
-                    failures += "${entry.name}: небезопасный путь"
-                    completedFiles.incrementAndGet()
-                    publishProgress(ExtractionPhase.PREPARING, force = true)
-                    continue
-                }
-
                 try {
-                    var parent = outputRoot
-                    for (directoryName in segments.dropLast(1)) {
-                        parent = findOrCreateDirectory(parent, directoryName)
+                    val segments = safePathSegments(entry.name)
+                    if (segments == null) {
+                        failures += "${entry.name}: небезопасный путь"
+                        completedFiles.incrementAndGet()
+                    } else {
+                        var parent = outputRootState
+                        for (directoryName in segments.dropLast(1)) {
+                            parent = findOrCreateDirectory(parent, directoryName)
+                        }
+                        val outputFile = createUniqueFile(parent, segments.last())
+                        plannedFiles += PlannedFile(entry, outputFile)
+                        totalBytes.updateAndGet { current ->
+                            if (Long.MAX_VALUE - current < entry.unpackedSize) Long.MAX_VALUE
+                            else current + entry.unpackedSize
+                        }
                     }
-                    val outputFile = createUniqueFile(parent, segments.last())
-                    plannedFiles += PlannedFile(entry, outputFile)
                 } catch (error: Exception) {
                     failures += "${entry.name}: ${error.message ?: "ошибка подготовки файла"}"
                     completedFiles.incrementAndGet()
-                    publishProgress(ExtractionPhase.PREPARING, force = true)
+                } finally {
+                    preparedFiles.incrementAndGet()
+                    // Rate-limit UI callbacks; progress still advances for every entry.
+                    publishProgress(ExtractionPhase.PREPARING)
                 }
             }
 
@@ -266,13 +280,16 @@ class ArchiveExtractor(
         return segments
     }
 
-    private fun findOrCreateDirectory(parent: DocumentFile, name: String): DocumentFile {
-        val existing = parent.findFile(name)
-        if (existing != null) {
-            if (!existing.isDirectory) throw IOException("В пути уже существует файл: $name")
-            return existing
+    private fun findOrCreateDirectory(parent: DirectoryState, name: String): DirectoryState {
+        parent.directories[name]?.let { return it }
+        if (name in parent.occupiedNames) {
+            throw IOException("В пути уже существует файл: $name")
         }
-        return parent.createDirectory(name) ?: throw IOException("Не удалось создать папку: $name")
+
+        val created = parent.document.createDirectory(name)
+            ?: throw IOException("Не удалось создать папку: $name")
+        parent.occupiedNames += name
+        return DirectoryState(created).also { parent.directories[name] = it }
     }
 
     private fun createUniqueDirectory(parent: DocumentFile, requestedName: String): DocumentFile {
@@ -286,20 +303,27 @@ class ArchiveExtractor(
             ?: throw IOException("Не удалось создать папку для извлечённых файлов.")
     }
 
-    private fun createUniqueFile(parent: DocumentFile, requestedName: String): DocumentFile {
+    private fun createUniqueFile(parent: DirectoryState, requestedName: String): DocumentFile {
         val extensionIndex = requestedName.lastIndexOf('.')
         val base = if (extensionIndex > 0) requestedName.substring(0, extensionIndex) else requestedName
         val extension = if (extensionIndex > 0) requestedName.substring(extensionIndex) else ""
 
         var candidate = requestedName
         var suffix = 2
-        while (parent.findFile(candidate) != null) {
+        while (candidate in parent.occupiedNames) {
             candidate = "$base ($suffix)$extension"
             suffix++
         }
 
-        return parent.createFile("application/octet-stream", candidate)
+        val created = parent.document.createFile("application/octet-stream", candidate)
             ?: throw IOException("Не удалось создать файл: $candidate")
+        parent.occupiedNames += candidate
+        return created
+    }
+
+    private class DirectoryState(val document: DocumentFile) {
+        val occupiedNames = HashSet<String>()
+        val directories = HashMap<String, DirectoryState>()
     }
 
     private data class PlannedFile(
